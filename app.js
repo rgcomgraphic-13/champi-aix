@@ -1,37 +1,89 @@
 (function () {
-  const B = window.BIOTOPE, SPECIES = window.SPECIES, Model = window.Model;
+  const B = window.BIOTOPE, SPECIES = window.SPECIES, COVER = window.COVER, Model = window.Model;
   const ROWS = B.rows, COLS = B.cols, NC = ROWS * COLS;
+  const DLAT = (B.N - B.S) / ROWS, DLON = (B.E - B.W) / COLS;
   const PAST = 20, FUTURE = 7;           // jours d'historique et de prévision
-  const WN = 7;                          // grille météo WN x WN (~15 km entre points)
-  const CACHE_KEY = "champiAix.weather.v1";
+  const WN = 6;                          // points météo WN x WN (~10 km entre points)
+  const MS = 32, MR = ROWS / MS, MC = COLS / MS; // mailles météo intermédiaires (~800 m)
+  const CACHE_KEY = "champiAix.weather.v2";
   const MAX_AGE_H = 6;
+  const LAPSE = 0.0065;
 
   const $ = (id) => document.getElementById(id);
-  const state = { sp: "all", day: 0, weather: null, cellW: null, scores: null, marker: null, sel: null };
+  const state = { sp: "all", day: 0, weather: null, todayIdx: PAST, med: null, scores: null, pyr: null, sel: null };
+  const cellM = Math.round(DLAT * 111320);
 
-  // ---------- biotope par maille ----------
-  const bio = new Array(NC);
-  (function prepBio() {
-    const dy = B.dlat * 111320;
-    for (let r = 0; r < ROWS; r++) {
-      const lat = B.N - (r + 0.5) * B.dlat;
-      const dx = B.dlon * 111320 * Math.cos(lat * Math.PI / 180);
-      for (let c = 0; c < COLS; c++) {
-        const i = r * COLS + c;
-        const z = (rr, cc) => B.elev[Math.min(ROWS - 1, Math.max(0, rr)) * COLS + Math.min(COLS - 1, Math.max(0, cc))];
-        const gx = (z(r, c + 1) - z(r, c - 1)) / (2 * dx);
-        const gy = (z(r - 1, c) - z(r + 1, c)) / (2 * dy); // > 0 : ça monte vers le nord
-        const slope = Math.hypot(gx, gy);
-        bio[i] = {
-          conifer: B.conifer[i] / 100, broad: B.broad[i] / 100, mixed: B.mixed[i] / 100,
-          unknown: B.unknown[i] / 100, meadow: B.meadow[i] / 100, scrub: (B.scrub ? B.scrub[i] : 0) / 100, elev: B.elev[i],
-          slope, northness: slope > 1e-4 ? gy / slope * -1 : 0, gx, inside: B.inside[i] === 1,
-          lat, lon: B.W + (c + 0.5) * B.dlon
-        };
-        bio[i].forest = bio[i].conifer + bio[i].broad + bio[i].mixed + bio[i].unknown;
+  // ---------- biotope fin (image RGB : R = couvert, G = altitude/5, B = exposition) ----------
+  let RCH, GCH, BCH, EDGE, SITE, covered, coverPyr;
+  const SITE_MAX = 1.4;
+  function decodeBiotope() {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => {
+        const cv = document.createElement("canvas"); cv.width = COLS; cv.height = ROWS;
+        const g = cv.getContext("2d", { willReadFrequently: true });
+        g.drawImage(img, 0, 0);
+        const d = g.getImageData(0, 0, COLS, ROWS).data;
+        RCH = new Uint8Array(NC); GCH = new Uint8Array(NC); BCH = new Uint8Array(NC);
+        let n = 0;
+        for (let i = 0, j = 0; i < NC; i++, j += 4) {
+          RCH[i] = d[j]; GCH[i] = d[j + 1]; BCH[i] = d[j + 2];
+          if ((d[j] & 128) && (d[j] & 15)) n++;
+        }
+        covered = new Int32Array(n);
+        const cov = new Uint8Array(NC);
+        for (let i = 0, k = 0; i < NC; i++) if ((RCH[i] & 128) && (RCH[i] & 15)) { covered[k++] = i; cov[i] = 1; }
+        coverPyr = pyramid(cov);
+        // lisière : case boisée avec une case non boisée à 50 m ou moins
+        const forest = (i) => { const c = RCH[i] & 15; return c && c !== 11 && c !== 12 && c !== 14; };
+        EDGE = new Uint8Array(NC);
+        for (let k = 0; k < covered.length; k++) {
+          const i = covered[k];
+          if (!forest(i)) continue;
+          const r = (i / COLS) | 0, c = i % COLS;
+          for (const [dr, dc] of [[-1, 0], [1, 0], [0, -1], [0, 1], [-2, 0], [2, 0], [0, -2], [0, 2]]) {
+            const rr = r + dr, cc = c + dc;
+            if (rr >= 0 && cc >= 0 && rr < ROWS && cc < COLS && !forest(rr * COLS + cc)) { EDGE[i] = 1; break; }
+          }
+        }
+        // facteur biotope de chaque case et espèce, indépendant de la météo : calculé une fois
+        SITE = SPECIES.map(sp => {
+          const a = new Uint8Array(covered.length);
+          for (let k = 0; k < covered.length; k++) {
+            const i = covered[k];
+            a[k] = Math.min(255, Math.round(Model.site(sp, coverOf(i), isOpen(i), elevOf(i), ubacOf(i), tpiOf(i), EDGE[i]) / SITE_MAX * 255));
+          }
+          return a;
+        });
+        resolve();
+      };
+      img.onerror = () => reject(new Error("biotope illisible"));
+      img.src = B.png;
+    });
+  }
+  const coverOf = (i) => RCH[i] & 15;
+  const isOpen = (i) => (RCH[i] >> 4) & 1;
+  const elevOf = (i) => GCH[i] * 5;
+  const ubacOf = (i) => (BCH[i] >> 4) / 7.5 - 1;
+  const tpiOf = (i) => (RCH[i] >> 5) & 3;
+  const cellLat = (r) => B.N - (r + 0.5) * DLAT;
+  const cellLon = (c) => B.W + (c + 0.5) * DLON;
+  const medOf = (i) => ((Math.floor(i / COLS) / MS) | 0) * MC + (((i % COLS) / MS) | 0);
+
+  // pyramide de maxima pour l'affichage aux petits zooms
+  function pyramid(base) {
+    const out = [base];
+    let n = ROWS, prev = base;
+    for (let L = 1; L <= 7; L++) {
+      const m = n >> 1, cur = new Uint8Array(m * m);
+      for (let r = 0; r < m; r++) for (let c = 0; c < m; c++) {
+        const a = (2 * r) * n + 2 * c;
+        cur[r * m + c] = Math.max(prev[a], prev[a + 1], prev[a + n], prev[a + n + 1]);
       }
+      out.push(cur); prev = cur; n = m;
     }
-  })();
+    return out;
+  }
 
   // ---------- météo ----------
   const wLats = [], wLons = [];
@@ -39,174 +91,243 @@
     wLats.push(B.S + (B.N - B.S) * k / (WN - 1));
     wLons.push(B.W + (B.E - B.W) * k / (WN - 1));
   }
+  function todayStr() { return new Date().toLocaleDateString("fr-CA", { timeZone: "Europe/Paris" }); }
 
   async function fetchWeather() {
     const pts = [];
     for (const la of wLats) for (const lo of wLons) pts.push([la, lo]);
-    const vars = "precipitation_sum,temperature_2m_mean,temperature_2m_min,relative_humidity_2m_mean,soil_moisture_0_to_7cm_mean";
-    const out = [];
-    for (let i = 0; i < pts.length; i += 25) {
-      const ch = pts.slice(i, i + 25);
-      const url = "https://api.open-meteo.com/v1/forecast?latitude=" + ch.map(p => p[0].toFixed(3)).join(",")
-        + "&longitude=" + ch.map(p => p[1].toFixed(3)).join(",")
-        + "&daily=" + vars + "&past_days=" + PAST + "&forecast_days=" + FUTURE + "&timezone=Europe%2FParis";
-      let res = await fetch(url);
-      for (let attempt = 0; res.status === 429 && attempt < 2; attempt++) {
-        setStatus("Quota Open-Meteo atteint, nouvelle tentative dans une minute…", "load");
-        await new Promise(r => setTimeout(r, 65e3));
-        res = await fetch(url);
-      }
-      if (!res.ok) throw new Error("Open-Meteo a répondu " + res.status);
-      const js = await res.json();
-      (Array.isArray(js) ? js : [js]).forEach(p => out.push({
-        elev: p.elevation, time: p.daily.time,
-        rain: p.daily.precipitation_sum, tmean: p.daily.temperature_2m_mean, tmin: p.daily.temperature_2m_min,
-        rh: p.daily.relative_humidity_2m_mean, soil: p.daily.soil_moisture_0_to_7cm_mean
-      }));
+    const url = "https://api.open-meteo.com/v1/forecast?latitude=" + pts.map(p => p[0].toFixed(3)).join(",")
+      + "&longitude=" + pts.map(p => p[1].toFixed(3)).join(",")
+      + "&daily=precipitation_sum,temperature_2m_mean,temperature_2m_min,relative_humidity_2m_mean,soil_moisture_0_to_7cm_mean"
+      + "&past_days=" + PAST + "&forecast_days=" + FUTURE + "&timezone=Europe%2FParis";
+    let res = await fetch(url);
+    for (let a = 0; res.status === 429 && a < 2; a++) {
+      setStatus("Quota Open-Meteo atteint, nouvelle tentative dans une minute…", "load");
+      await new Promise(r => setTimeout(r, 65e3));
+      res = await fetch(url);
     }
-    return { fetchedAt: Date.now(), day: todayStr(), points: out };
+    if (!res.ok) throw new Error("Open-Meteo a répondu " + res.status);
+    const js = await res.json();
+    return {
+      fetchedAt: Date.now(), day: todayStr(), points: (Array.isArray(js) ? js : [js]).map(p => ({
+        elev: p.elevation, time: p.daily.time, rain: p.daily.precipitation_sum, tmean: p.daily.temperature_2m_mean,
+        tmin: p.daily.temperature_2m_min, rh: p.daily.relative_humidity_2m_mean, soil: p.daily.soil_moisture_0_to_7cm_mean
+      }))
+    };
   }
+  function fill(a, def) { let last = def; return a.map(v => (v == null || Number.isNaN(v)) ? last : (last = v)); }
 
-  function todayStr() {
-    return new Date().toLocaleDateString("fr-CA", { timeZone: "Europe/Paris" }); // AAAA-MM-JJ
-  }
-
-  function fill(a, def) { // bouche les trous éventuels
-    let last = def;
-    return a.map(v => (v == null || Number.isNaN(v)) ? last : (last = v));
-  }
-
-  // interpolation bilinéaire vers chaque maille + correction d'altitude de la température
-  function buildCellWeather(wx) {
+  // séries météo par maille intermédiaire ; températures ramenées au niveau de la mer
+  function buildMed(wx) {
     const P = wx.points.map(p => ({
-      elev: p.elev, rain: fill(p.rain, 0), tmean: fill(p.tmean, 12), tmin: fill(p.tmin, 8),
-      rh: fill(p.rh, 65), soil: fill(p.soil, 0.15)
+      rain: fill(p.rain, 0), rh: fill(p.rh, 65), soil: fill(p.soil, 0.15),
+      t0: fill(p.tmean, 12).map(t => t + LAPSE * p.elev), n0: fill(p.tmin, 8).map(t => t + LAPSE * p.elev)
     }));
-    const nd = wx.points[0].time.length;
-    const cw = new Array(NC);
-    for (let i = 0; i < NC; i++) {
-      const b = bio[i];
-      if (!b.inside || b.forest + b.meadow + b.scrub < 0.02) continue;
-      const fy = (b.lat - B.S) / (B.N - B.S) * (WN - 1), fx = (b.lon - B.W) / (B.E - B.W) * (WN - 1);
-      const y0 = Math.min(WN - 2, Math.floor(fy)), x0 = Math.min(WN - 2, Math.floor(fx));
-      const ty = fy - y0, tx = fx - x0;
-      const nb = [[y0, x0, (1 - ty) * (1 - tx)], [y0, x0 + 1, (1 - ty) * tx], [y0 + 1, x0, ty * (1 - tx)], [y0 + 1, x0 + 1, ty * tx]];
-      const o = { rain: new Float32Array(nd), tmean: new Float32Array(nd), tmin: new Float32Array(nd), rh: new Float32Array(nd), soil: new Float32Array(nd) };
-      let pe = 0;
-      for (const [yy, xx, w] of nb) {
-        const p = P[yy * WN + xx]; pe += p.elev * w;
-        for (let d = 0; d < nd; d++) {
-          o.rain[d] += p.rain[d] * w; o.tmean[d] += p.tmean[d] * w; o.tmin[d] += p.tmin[d] * w;
-          o.rh[d] += p.rh[d] * w; o.soil[d] += p.soil[d] * w;
-        }
+    const nd = wx.points[0].time.length, med = new Array(MR * MC);
+    for (let mr = 0; mr < MR; mr++) for (let mc = 0; mc < MC; mc++) {
+      const lat = B.N - (mr + 0.5) * MS * DLAT, lon = B.W + (mc + 0.5) * MS * DLON;
+      const fy = (lat - B.S) / (B.N - B.S) * (WN - 1), fx = (lon - B.W) / (B.E - B.W) * (WN - 1);
+      const y0 = Math.min(WN - 2, Math.floor(fy)), x0 = Math.min(WN - 2, Math.floor(fx)), ty = fy - y0, tx = fx - x0;
+      const o = { rain: new Float32Array(nd), rh: new Float32Array(nd), soil: new Float32Array(nd), t0: new Float32Array(nd), n0: new Float32Array(nd) };
+      for (const [yy, xx, w] of [[y0, x0, (1 - ty) * (1 - tx)], [y0, x0 + 1, (1 - ty) * tx], [y0 + 1, x0, ty * (1 - tx)], [y0 + 1, x0 + 1, ty * tx]]) {
+        const p = P[yy * WN + xx];
+        for (let d = 0; d < nd; d++) { o.rain[d] += p.rain[d] * w; o.rh[d] += p.rh[d] * w; o.soil[d] += p.soil[d] * w; o.t0[d] += p.t0[d] * w; o.n0[d] += p.n0[d] * w; }
       }
-      const dT = -0.0065 * (b.elev - pe);
-      for (let d = 0; d < nd; d++) { o.tmean[d] += dT; o.tmin[d] += dT; }
-      cw[i] = o;
+      med[mr * MC + mc] = o;
     }
-    return cw;
+    return med;
   }
 
-  // ---------- calcul des indices ----------
-  function dayIndex(offset) { return state.todayIdx + offset; }
-  function dayDate(offset) { const d = new Date(state.weather.points[0].time[dayIndex(offset)] + "T12:00:00"); return d; }
+  function dayDate(o) { return new Date(state.weather.points[0].time[state.todayIdx + o] + "T12:00:00"); }
 
-  function computeDay(offset) {
-    const d = dayIndex(offset), date = dayDate(offset);
-    const per = {};
-    for (const sp of SPECIES) per[sp.id] = new Float32Array(NC);
-    const all = new Float32Array(NC);
-    for (let i = 0; i < NC; i++) {
-      const w = state.cellW[i];
-      if (!w) continue;
-      let m = 0;
-      for (const sp of SPECIES) {
-        const s = Model.score(sp, bio[i], w, d, date).total;
-        per[sp.id][i] = s; if (s > m) m = s;
-      }
-      all[i] = m;
-    }
-    per.all = all;
-    return per;
-  }
-
+  // facteurs météo par maille intermédiaire pour un jour donné
   const dayCache = new Map();
-  function scoresFor(offset) {
-    if (!dayCache.has(offset)) dayCache.set(offset, computeDay(offset));
-    return dayCache.get(offset);
+  function dayFactors(o) {
+    if (dayCache.has(o)) return dayCache.get(o);
+    const d = state.todayIdx + o, date = dayDate(o), n = MR * MC;
+    const wf = SPECIES.map(() => new Float32Array(n)), tm = new Float32Array(n), tn = new Float32Array(n);
+    for (let m = 0; m < n; m++) {
+      const w = state.med[m];
+      SPECIES.forEach((sp, k) => { wf[k][m] = Model.weather(sp, w, d, date).f; });
+      let s = 0, c = 0, mn = 99;
+      for (let i = Math.max(0, d - 6); i <= d; i++) { s += w.t0[i]; c++; }
+      for (let i = Math.max(0, d - 3); i <= d; i++) mn = Math.min(mn, w.n0[i]);
+      tm[m] = s / c; tn[m] = mn;
+    }
+    const f = { wf, tm, tn };
+    dayCache.set(o, f);
+    return f;
+  }
+
+  // interpolation bilinéaire entre les centres des 4 mailles météo voisines (évite les marches)
+  const NB = { m: [0, 0, 0, 0], w: [0, 0, 0, 0] };
+  function neighbours(i) {
+    const fr = Math.min(MR - 1.0001, Math.max(0, ((i / COLS) | 0) / MS + 0.5 / MS - 0.5));
+    const fc = Math.min(MC - 1.0001, Math.max(0, (i % COLS) / MS + 0.5 / MS - 0.5));
+    const r0 = fr | 0, c0 = fc | 0, ty = fr - r0, tx = fc - c0, m = r0 * MC + c0;
+    NB.m[0] = m; NB.m[1] = m + 1; NB.m[2] = m + MC; NB.m[3] = m + MC + 1;
+    NB.w[0] = (1 - ty) * (1 - tx); NB.w[1] = (1 - ty) * tx; NB.w[2] = ty * (1 - tx); NB.w[3] = ty * tx;
+    return NB;
+  }
+  const interp = (arr, nb) => arr[nb.m[0]] * nb.w[0] + arr[nb.m[1]] * nb.w[1] + arr[nb.m[2]] * nb.w[2] + arr[nb.m[3]] * nb.w[3];
+
+  function cellScore(i, k, f) {
+    const nb = neighbours(i), w = interp(f.wf[k], nb);
+    if (w <= 0.0005) return 0;
+    const sp = SPECIES[k], z = elevOf(i);
+    const T = Model.tempFactor(sp, interp(f.tm, nb) - LAPSE * z, interp(f.tn, nb) - LAPSE * z);
+    if (!T) return 0;
+    return Math.min(1, w * T * Model.site(sp, coverOf(i), isOpen(i), z, ubacOf(i), tpiOf(i), EDGE[i])) * 100;
+  }
+  const spIdx = (id) => id === "all" ? SPECIES.map((_, k) => k) : [SPECIES.findIndex(s => s.id === id)];
+
+  // indices maximums par espèce sur un échantillon de cases (chiffres des boutons), mis en cache
+  const maxCache = new Map();
+  function sampleMaxes(o, ks, step) {
+    const key = o + ":" + ks.join(","), hit = maxCache.get(key);
+    if (hit) return hit;
+    const f = dayFactors(o), mx = new Float32Array(SPECIES.length);
+    for (let j = 0; j < covered.length; j += step) {
+      for (const k of ks) { const s = bestScore(j, [k], f); if (s > mx[k]) mx[k] = s; }
+    }
+    maxCache.set(key, mx);
+    return mx;
+  }
+  function sampleMax(id, o, step = 6) {
+    const ks = spIdx(id), mx = sampleMaxes(o, spIdx("all"), step);
+    return Math.max(...ks.map(k => mx[k]));
+  }
+
+  // meilleur indice de la case covered[j] pour une liste d'espèces (version rapide, biotope précalculé)
+  function bestScore(j, ks, f) {
+    const i = covered[j];
+    let nb = null, best = 0, tm, tn;
+    for (const k of ks) {
+      const st = SITE[k][j];
+      if (!st) continue;
+      if (!nb) {
+        nb = neighbours(i);
+        const z = elevOf(i);
+        tm = interp(f.tm, nb) - LAPSE * z; tn = interp(f.tn, nb) - LAPSE * z;
+      }
+      const w = interp(f.wf[k], nb);
+      if (w <= 0.0005) continue;
+      const T = Model.tempFactor(SPECIES[k], tm, tn);
+      if (!T) continue;
+      const s = Math.min(1, w * T * st * (SITE_MAX / 255)) * 100;
+      if (s > best) best = s;
+    }
+    return best;
+  }
+
+  function computeScores() {
+    const f = dayFactors(state.day), ks = spIdx(state.sp), out = new Uint8Array(NC);
+    for (let j = 0; j < covered.length; j++) out[covered[j]] = Math.round(bestScore(j, ks, f));
+    state.scores = out;
+    state.pyr = pyramid(out);
   }
 
   // ---------- couleurs ----------
-  const STOPS = [[10, [241, 226, 140], 0], [22, [241, 226, 140], .6], [38, [236, 178, 52], .72], [55, [222, 106, 30], .8], [72, [180, 40, 24], .85], [88, [100, 16, 30], .9]];
-  function ramp(s) {
-    if (s <= STOPS[0][0]) return null;
-    for (let k = 1; k < STOPS.length; k++) {
-      if (s <= STOPS[k][0]) {
-        const [a, ca, aa] = STOPS[k - 1], [b, cb, ab] = STOPS[k], t = (s - a) / (b - a);
-        return [0, 1, 2].map(j => Math.round(ca[j] + (cb[j] - ca[j]) * t)).concat(aa + (ab - aa) * t);
-      }
+  const DRAW_MIN = 25; // en dessous, la case n'est pas colorée (seulement quadrillée)
+  const STOPS = [[25, [250, 190, 120], .45], [40, [246, 150, 70], .6], [55, [240, 100, 40], .72], [70, [228, 52, 24], .82], [88, [175, 18, 12], .9]];
+  const COLORS = [], SOLID = [];
+  for (let s = 0; s <= 100; s++) {
+    let c = null;
+    if (s >= STOPS[0][0]) {
+      let k = 1; while (k < STOPS.length - 1 && s > STOPS[k][0]) k++;
+      const [a, ca, aa] = STOPS[k - 1], [b, cb, ab] = STOPS[k], t = Math.min(1, Math.max(0, (s - a) / (b - a)));
+      c = [0, 1, 2].map(j => Math.round(ca[j] + (cb[j] - ca[j]) * t)).concat(+(aa + (ab - aa) * t).toFixed(2));
     }
-    const l = STOPS[STOPS.length - 1]; return l[1].concat(l[2]);
+    COLORS.push(c ? `rgba(${c[0]},${c[1]},${c[2]},${c[3]})` : null);
+    SOLID.push(c ? `rgb(${c[0]},${c[1]},${c[2]})` : null);
   }
-  const css = (s) => { const c = ramp(Math.max(s, 23)); return `rgb(${c[0]},${c[1]},${c[2]})`; };
+  const solid = (s) => SOLID[Math.max(20, Math.min(100, Math.round(s)))];
 
   // ---------- carte ----------
-  const map = L.map("map", { zoomControl: true, preferCanvas: true }).setView(B.center, 10);
-  const topo = L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { maxZoom: 17, className: "muted", attribution: "© OpenTopoMap, © OpenStreetMap" });
-  const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, className: "muted", attribution: "© OpenStreetMap" });
-  const sat = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", { maxZoom: 19, attribution: "© Esri" });
-  topo.addTo(map);
-  const bounds = [[B.S, B.W], [B.N, B.E]];
-  const overlay = L.imageOverlay("data:image/gif;base64,R0lGODlhAQABAAAAACw=", bounds, { opacity: 1, interactive: false }).addTo(map);
-  const zone = L.circle(B.center, { radius: B.radiusKm * 1000, color: "#a3461f", weight: 1.5, dashArray: "6 6", fill: false, interactive: false }).addTo(map);
-  map.fitBounds(zone.getBounds(), { padding: [8, 8] });
-  L.circleMarker(B.center, { radius: 4, color: "#1d2620", weight: 2, fillColor: "#fff", fillOpacity: 1 }).bindTooltip("Aix-en-Provence").addTo(map);
-  L.control.layers({ "Relief": topo, "Plan": osm, "Satellite": sat }, { "Indice de pousse": overlay }, { position: "topright" }).addTo(map);
+  const ign = (layer, fmt) => "https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=" + layer
+    + "&STYLE=normal&TILEMATRIXSET=PM&FORMAT=" + fmt + "&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}";
+  const bases = {
+    "Plan OpenStreetMap": L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© contributeurs OpenStreetMap" }),
+    "Plan IGN": L.tileLayer(ign("GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2", "image/png"), { maxZoom: 19, maxNativeZoom: 19, attribution: "© IGN" }),
+    "Photo aérienne IGN": L.tileLayer(ign("ORTHOIMAGERY.ORTHOPHOTOS", "image/jpeg"), { maxZoom: 19, maxNativeZoom: 19, attribution: "© IGN" }),
+    "Relief": L.tileLayer("https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", { maxZoom: 19, maxNativeZoom: 17, attribution: "© OpenTopoMap, © OpenStreetMap" })
+  };
+  const map = L.map("map", { minZoom: 9, maxZoom: 19 });
+  let baseName = "Plan OpenStreetMap";
+  try { const b = localStorage.getItem("champiAix.base"); if (b && bases[b]) baseName = b; } catch (_) { }
+  bases[baseName].addTo(map);
+  map.on("baselayerchange", (e) => { try { localStorage.setItem("champiAix.base", e.name); } catch (_) { } });
+
+  map.fitBounds(L.latLng(B.center).toBounds(B.radiusKm * 2000), { padding: [6, 6] });
+  L.circle(B.center, { radius: B.radiusKm * 1000, color: "#b5341a", weight: 2, dashArray: "8 6", fill: false, interactive: false }).addTo(map);
+  L.circleMarker(B.center, { radius: 4, color: "#1d2620", weight: 2, fillColor: "#fff", fillOpacity: 1, interactive: false }).addTo(map);
+
+  // quadrillage dessiné sur des tuiles canvas, case par case
+  const mercY = (lat, ws) => (1 - Math.asinh(Math.tan(lat * Math.PI / 180)) / Math.PI) / 2 * ws;
+  const unY = (y, ws) => Math.atan(Math.sinh(Math.PI * (1 - 2 * y / ws))) * 180 / Math.PI;
+  const Grid = L.GridLayer.extend({
+    createTile(coords) {
+      const tile = document.createElement("canvas"), dpr = Math.min(2, window.devicePixelRatio || 1);
+      tile.width = tile.height = 256 * dpr;
+      if (!state.pyr) return tile;
+      const g = tile.getContext("2d"); g.scale(dpr, dpr);
+      const z = coords.z, ws = 256 * Math.pow(2, z), px0 = coords.x * 256, py0 = coords.y * 256;
+      const cellPx = DLON / 360 * ws;
+      let Lv = 0; while (Lv < 7 && cellPx * (1 << Lv) < 5) Lv++;
+      const b = 1 << Lv, rowsL = ROWS >> Lv, colsL = COLS >> Lv, P = state.pyr[Lv], CP = coverPyr[Lv];
+      const lonW = px0 / ws * 360 - 180, lonE = (px0 + 256) / ws * 360 - 180;
+      const latN = unY(py0, ws), latS = unY(py0 + 256, ws);
+      const c0 = Math.max(0, Math.floor((lonW - B.W) / DLON / b)), c1 = Math.min(colsL - 1, Math.floor((lonE - B.W) / DLON / b));
+      const r0 = Math.max(0, Math.floor((B.N - latN) / DLAT / b)), r1 = Math.min(rowsL - 1, Math.floor((B.N - latS) / DLAT / b));
+      if (c1 < c0 || r1 < r0) return tile;
+      const xs = [], ys = [];
+      for (let c = c0; c <= c1 + 1; c++) xs.push((B.W + c * b * DLON + 180) / 360 * ws - px0);
+      for (let r = r0; r <= r1 + 1; r++) ys.push(mercY(B.N - r * b * DLAT, ws) - py0);
+      const size = cellPx * b, edge = size >= 9, grid = size >= 11;
+      g.lineWidth = 0.6;
+      for (let r = r0; r <= r1; r++) {
+        const y = ys[r - r0], h = ys[r - r0 + 1] - y;
+        for (let c = c0; c <= c1; c++) {
+          const k = r * colsL + c, s = P[k];
+          const x = xs[c - c0], w = xs[c - c0 + 1] - x;
+          if (s >= DRAW_MIN) {
+            g.fillStyle = COLORS[s];
+            g.fillRect(x, y, w, h);
+            if (edge) { g.strokeStyle = "rgba(110,25,10,.35)"; g.strokeRect(x + .3, y + .3, w - .6, h - .6); }
+          } else if (grid && CP[k]) {
+            g.strokeStyle = "rgba(90,70,30,.13)"; g.strokeRect(x + .3, y + .3, w - .6, h - .6);
+          }
+        }
+      }
+      return tile;
+    }
+  });
+  const overlay = new Grid({ tileSize: 256, zIndex: 5, opacity: 0.9, updateWhenZooming: false, maxZoom: 19 }).addTo(map);
+  L.control.layers(bases, { "Indice de pousse": overlay }, { position: "topright" }).addTo(map);
 
   const Locate = L.Control.extend({
     onAdd() {
       const b = L.DomUtil.create("div", "leaflet-bar");
       b.innerHTML = '<a href="#" class="locate" title="Ma position" role="button" aria-label="Ma position">◎</a>';
-      L.DomEvent.on(b, "click", (e) => { L.DomEvent.preventDefault(e); map.locate({ setView: true, maxZoom: 13 }); });
+      L.DomEvent.on(b, "click", (e) => { L.DomEvent.preventDefault(e); L.DomEvent.stopPropagation(e); map.locate({ setView: true, maxZoom: 16 }); });
       return b;
     }
   });
   new Locate({ position: "topleft" }).addTo(map);
   let me = null;
-  map.on("locationfound", (e) => { me && me.remove(); me = L.circleMarker(e.latlng, { radius: 7, color: "#fff", weight: 2, fillColor: "#2b6cb0", fillOpacity: 1 }).addTo(map); });
-  map.on("locationerror", () => setStatus("Position indisponible dans ce navigateur", "err", true));
-
-  const SCALE = 8;
-  const small = document.createElement("canvas"); small.width = COLS; small.height = ROWS;
-  const big = document.createElement("canvas"); big.width = COLS * SCALE; big.height = ROWS * SCALE;
-  function drawOverlay(arr) {
-    const sctx = small.getContext("2d"), img = sctx.createImageData(COLS, ROWS);
-    for (let i = 0; i < NC; i++) {
-      const c = ramp(arr[i]);
-      if (!c) continue;
-      img.data.set([c[0], c[1], c[2], Math.round(c[3] * 255)], i * 4);
-    }
-    sctx.putImageData(img, 0, 0);
-    const g = big.getContext("2d");
-    g.clearRect(0, 0, big.width, big.height);
-    g.save();
-    // découpe le cercle de 50 km (ellipse en coordonnées de grille)
-    const cx = (B.center[1] - B.W) / B.dlon * SCALE, cy = (B.N - B.center[0]) / B.dlat * SCALE;
-    const ry = B.radiusKm / 111.32 / B.dlat * SCALE, rx = B.radiusKm / (111.32 * Math.cos(B.center[0] * Math.PI / 180)) / B.dlon * SCALE;
-    g.beginPath(); g.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); g.clip();
-    g.imageSmoothingEnabled = true; g.imageSmoothingQuality = "high";
-    g.drawImage(small, 0, 0, big.width, big.height);
-    g.restore();
-    overlay.setUrl(big.toDataURL());
-  }
+  map.on("locationfound", (e) => {
+    me && me.remove();
+    me = L.layerGroup([L.circle(e.latlng, { radius: e.accuracy, weight: 1, color: "#2b6cb0", fillOpacity: .08, interactive: false }),
+    L.circleMarker(e.latlng, { radius: 7, color: "#fff", weight: 2, fillColor: "#2b6cb0", fillOpacity: 1 })]).addTo(map);
+  });
+  map.on("locationerror", () => setStatus("Position indisponible : autorisez la localisation dans le navigateur", "err", true));
 
   // ---------- lieux ----------
   function km(a, b, c, d) {
-    const R = 6371, p = Math.PI / 180;
-    const h = Math.sin((c - a) * p / 2) ** 2 + Math.cos(a * p) * Math.cos(c * p) * Math.sin((d - b) * p / 2) ** 2;
-    return 2 * R * Math.asin(Math.sqrt(h));
+    const p = Math.PI / 180, h = Math.sin((c - a) * p / 2) ** 2 + Math.cos(a * p) * Math.cos(c * p) * Math.sin((d - b) * p / 2) ** 2;
+    return 12742 * Math.asin(Math.sqrt(h));
   }
-  function nearestPlace(lat, lon, minRank = 1) {
+  function nearestPlace(lat, lon, minRank) {
     let best = null, bd = 1e9;
     for (const p of B.places) {
       if (p[3] < minRank) continue;
@@ -215,38 +336,30 @@
     }
     return best ? { name: best[0], km: bd } : { name: "?", km: 0 };
   }
-  function covertLabel(b) {
-    const parts = [];
-    if (b.conifer > 0.05) parts.push(["pins / résineux", b.conifer]);
-    if (b.broad > 0.05) parts.push(["feuillus (chênes…)", b.broad]);
-    if (b.mixed > 0.05) parts.push(["forêt mixte", b.mixed]);
-    if (b.unknown > 0.05) parts.push(["bois (essence non précisée)", b.unknown]);
-    if (b.meadow > 0.05) parts.push(["prairie", b.meadow]);
-    if (b.scrub > 0.05) parts.push(["garrigue", b.scrub]);
-    parts.sort((x, y) => y[1] - x[1]);
-    return parts.length ? parts.map(p => `${p[0]} ${Math.round(p[1] * 100)} %`).join(", ") : "peu de couvert favorable";
+  function placeLabel(lat, lon) {
+    const v = nearestPlace(lat, lon, 1), h = nearestPlace(lat, lon, 0);
+    return h.name !== v.name && h.km < v.km && h.km < 2 ? `${h.name}, ${v.name}` : `près de ${v.name}`;
   }
-  function aspectLabel(b) {
-    if (b.slope < 0.04) return "terrain plat";
-    const ang = Math.atan2(-b.gx, b.northness * b.slope) * 180 / Math.PI; // direction de la pente descendante
-    const dirs = ["nord", "nord-est", "est", "sud-est", "sud", "sud-ouest", "ouest", "nord-ouest"];
-    return "versant " + dirs[Math.round(((ang + 360) % 360) / 45) % 8] + (b.northness > 0.5 ? " (ubac, frais)" : b.northness < -0.5 ? " (adret, sec)" : "");
+  const DIRS = ["nord", "nord-est", "est", "sud-est", "sud", "sud-ouest", "ouest", "nord-ouest"];
+  function aspectLabel(i) {
+    const sec = BCH[i] & 15, u = ubacOf(i);
+    if (sec >= 8) return "terrain plat";
+    return "versant " + DIRS[sec] + (u > 0.4 ? " (ubac, frais)" : u < -0.4 ? " (adret, sec)" : "");
   }
+  const coverLabel = (i) => COVER[coverOf(i)] ? COVER[coverOf(i)] + (isOpen(i) ? ", clairsemée" : "") + (EDGE[i] ? ", en lisière" : "") : "Pas de forêt ni de prairie";
+  const TPI_LABEL = ["crête ou bosse (plus sec)", "pente ou replat", "léger creux (plus frais)", "combe ou vallon (humide)"];
 
   // ---------- interface ----------
   function setStatus(txt, kind, transient) {
-    const prev = $("status").textContent;
+    const prev = $("status").textContent, pk = $("dot").className;
     $("status").textContent = txt; $("dot").className = "dot" + (kind ? " " + kind : "");
-    if (transient) setTimeout(() => { $("status").textContent = prev; $("dot").className = "dot"; }, 3500);
+    if (transient) setTimeout(() => { $("status").textContent = prev; $("dot").className = pk; }, 4000);
   }
 
   function renderSpecies() {
-    const cur = scoresFor(state.day);
     const list = [{ id: "all", name: "Toutes" }].concat(SPECIES);
-    $("species").innerHTML = list.map(s => {
-      let mx = 0; const a = cur[s.id]; for (let i = 0; i < NC; i++) if (a[i] > mx) mx = a[i];
-      return `<button type="button" class="chip" data-id="${s.id}" aria-pressed="${s.id === state.sp}">${s.name}<span class="n">${Math.round(mx)}</span></button>`;
-    }).join("");
+    const mx = sampleMaxes(state.day, spIdx("all"), 6), val = (id) => Math.round(id === "all" ? Math.max(...mx) : mx[spIdx(id)[0]]);
+    $("species").innerHTML = list.map(s => `<button type="button" class="chip" data-id="${s.id}" aria-pressed="${s.id === state.sp}">${s.name}<span class="n">${val(s.id)}</span></button>`).join("");
     const sp = SPECIES.find(s => s.id === state.sp);
     $("spnote").innerHTML = sp ? `<i>${sp.latin}</i>. ${sp.note}` : "Meilleur indice toutes espèces confondues. Le chiffre sur chaque espèce est son meilleur indice dans la zone ce jour-là.";
   }
@@ -255,133 +368,132 @@
     const fmt = new Intl.DateTimeFormat("fr-FR", { weekday: "short" });
     let html = "";
     for (let o = 0; o < FUTURE; o++) {
-      const a = scoresFor(o)[state.sp];
-      let mx = 0; for (let i = 0; i < NC; i++) if (a[i] > mx) mx = a[i];
-      const d = dayDate(o);
-      const lab = o === 0 ? "auj." : fmt.format(d).replace(".", "");
-      html += `<button type="button" class="day" data-o="${o}" aria-pressed="${o === state.day}" title="Meilleur indice : ${Math.round(mx)}">${lab}<b>${d.getDate()}</b><i style="background:${mx > 10 ? css(mx) : ""}"></i></button>`;
+      const mx = sampleMax(state.sp, o), d = dayDate(o);
+      html += `<button type="button" class="day" data-o="${o}" aria-pressed="${o === state.day}" title="Meilleur indice : ${Math.round(mx)}">${o === 0 ? "auj." : fmt.format(d).replace(".", "")}<b>${d.getDate()}</b><i style="background:${mx >= 20 ? solid(mx) : ""}"></i></button>`;
     }
     $("days").innerHTML = html;
   }
 
   function renderSpots() {
-    const a = scoresFor(state.day)[state.sp];
+    const a = state.scores, hist = new Uint32Array(101);
+    for (let j = 0; j < covered.length; j++) hist[a[covered[j]]]++;
+    let thr = 100, acc = 0;
+    while (thr > 25 && acc + hist[thr] < 6000) { acc += hist[thr]; thr--; }
     const idx = [];
-    for (let i = 0; i < NC; i++) if (a[i] >= 20) idx.push(i);
+    for (let j = 0; j < covered.length; j++) { const i = covered[j]; if (a[i] >= Math.max(25, thr)) idx.push(i); }
     idx.sort((x, y) => a[y] - a[x]);
     const picked = [];
     for (const i of idx) {
-      if (picked.length >= 8) break;
-      if (picked.every(j => km(bio[i].lat, bio[i].lon, bio[j].lat, bio[j].lon) > 5)) picked.push(i);
+      if (picked.length >= 10) break;
+      const la = cellLat(Math.floor(i / COLS)), lo = cellLon(i % COLS);
+      if (picked.every(p => km(la, lo, p.la, p.lo) > 1.5)) picked.push({ i, la, lo });
     }
     if (!picked.length) {
-      $("spots").innerHTML = `<li class="empty" style="cursor:default;display:block">Aucun coin favorable ce jour-là. Il faut en général 25 à 35 mm de pluie puis une à deux semaines d'attente.</li>`;
+      $("spots").innerHTML = `<li class="empty">Aucun coin favorable ce jour-là. Il faut en général 25 à 35 mm de pluie puis une à deux semaines d'attente.</li>`;
       return;
     }
-    $("spots").innerHTML = picked.map(i => {
-      const b = bio[i], p = nearestPlace(b.lat, b.lon);
-      const best = state.sp === "all" ? SPECIES.reduce((m, s) => scoresFor(state.day)[s.id][i] > scoresFor(state.day)[m.id][i] ? s : m, SPECIES[0]).name : "";
-      return `<li tabindex="0" data-i="${i}"><span class="score" style="background:${css(a[i])}">${Math.round(a[i])}</span>
-        <span class="where"><b>près de ${p.name}</b><span>${best ? best + " · " : ""}${b.elev} m · ${covertLabel(b).split(",")[0]}</span></span>
-        <span class="km">${Math.round(km(B.center[0], B.center[1], b.lat, b.lon))} km</span></li>`;
+    const f = dayFactors(state.day);
+    $("spots").innerHTML = picked.map(({ i, la, lo }) => {
+      let best = "";
+      if (state.sp === "all") { let m = -1; SPECIES.forEach((s, k) => { const v = cellScore(i, k, f); if (v > m) { m = v; best = s.name; } }); }
+      return `<li tabindex="0" data-i="${i}"><span class="score" style="background:${solid(a[i])}">${a[i]}</span>
+        <span class="where"><b>${placeLabel(la, lo)}</b><span>${best ? best + " · " : ""}${elevOf(i)} m · ${COVER[coverOf(i)]}</span></span>
+        <span class="km">${km(B.center[0], B.center[1], la, lo).toFixed(0)} km</span></li>`;
     }).join("");
   }
 
   function rainChart(w) {
-    const n = w.rain.length, W = 320, H = 76, bw = W / n, max = Math.max(20, ...w.rain);
-    let s = `<svg class="rain" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Pluie journalière sur ${n} jours">`;
-    const base = H - 14;
+    const n = w.rain.length, Wd = 320, Hh = 76, bw = Wd / n, max = Math.max(20, ...w.rain), base = Hh - 14;
+    let s = `<svg class="rain" viewBox="0 0 ${Wd} ${Hh}" preserveAspectRatio="none" role="img" aria-label="Pluie journalière sur ${n} jours">`;
     for (let d = 0; d < n; d++) {
       const h = w.rain[d] / max * (base - 4), fut = d > state.todayIdx;
       s += `<rect x="${d * bw + 1}" y="${base - h}" width="${bw - 2}" height="${h}" fill="${fut ? "var(--muted)" : "var(--moss)"}" opacity="${fut ? .55 : 1}"></rect>`;
     }
     const tx = (state.todayIdx + 0.5) * bw;
     s += `<line x1="${tx}" x2="${tx}" y1="0" y2="${base}" stroke="var(--accent)" stroke-dasharray="2 2"></line>`;
-    s += `<text x="2" y="${H - 2}" font-size="10" fill="var(--muted)">-${PAST} j</text><text x="${tx}" y="${H - 2}" font-size="10" fill="var(--accent)" text-anchor="middle">auj.</text><text x="${W - 2}" y="${H - 2}" font-size="10" fill="var(--muted)" text-anchor="end">+${FUTURE - 1} j</text>`;
-    s += `<text x="${W - 2}" y="10" font-size="10" fill="var(--muted)" text-anchor="end">max ${Math.round(max)} mm</text></svg>`;
-    return s;
+    s += `<text x="2" y="${Hh - 2}" font-size="10" fill="var(--muted)">-${PAST} j</text><text x="${tx}" y="${Hh - 2}" font-size="10" fill="var(--accent)" text-anchor="middle">auj.</text><text x="${Wd - 2}" y="${Hh - 2}" font-size="10" fill="var(--muted)" text-anchor="end">+${FUTURE - 1} j</text>`;
+    return s + `<text x="${Wd - 2}" y="10" font-size="10" fill="var(--muted)" text-anchor="end">max ${Math.round(max)} mm</text></svg>`;
   }
 
-  function showDetail(i, latlng) {
+  let selLayer = null;
+  function showDetail(i) {
     state.sel = i;
-    const b = bio[i], w = state.cellW && state.cellW[i];
-    const ll = latlng || L.latLng(b.lat, b.lon);
-    state.marker && state.marker.remove();
-    state.marker = L.marker(ll).addTo(map);
+    const r = Math.floor(i / COLS), c = i % COLS, la = cellLat(r), lo = cellLon(c);
+    selLayer && selLayer.remove();
+    selLayer = L.layerGroup([
+      L.rectangle([[B.N - (r + 1) * DLAT, B.W + c * DLON], [B.N - r * DLAT, B.W + (c + 1) * DLON]], { color: "#1a5fb4", weight: 2.5, fill: false, interactive: false }),
+      L.circleMarker([la, lo], { radius: 3, color: "#1a5fb4", fillOpacity: 1, interactive: false })
+    ]).addTo(map);
     const el = $("detail"); el.hidden = false;
-    const p = nearestPlace(ll.lat, ll.lng), h = nearestPlace(ll.lat, ll.lng, 0);
-    const where = h.name !== p.name && h.km < p.km ? `${h.name}, près de ${p.name}` : `près de ${p.name}`;
-    const coords = `${ll.lat.toFixed(5)}, ${ll.lng.toFixed(5)}`;
-    let body = `<h3>${where}</h3><div class="note" style="margin:0">${coords} · ${Math.round(km(B.center[0], B.center[1], ll.lat, ll.lng))} km d'Aix</div>`;
-    if (!b.inside) { el.innerHTML = body + `<p class="note">Hors de la zone des 50 km.</p>`; return; }
-    if (!w) {
-      el.innerHTML = body + `<dl class="kv"><dt>Altitude</dt><dd>${b.elev} m</dd><dt>Couvert</dt><dd>${covertLabel(b)}</dd></dl><p class="note">Pas de forêt, garrigue ni prairie cartographiée ici : indice nul.</p>` + links(ll);
-      return;
-    }
-    const d = dayIndex(state.day), date = dayDate(state.day);
-    const rows = SPECIES.map(sp => ({ sp, r: Model.score(sp, b, w, d, date) })).sort((x, y) => y.r.total - x.r.total);
-    const top = rows[0].r;
-    let cum15 = 0; for (let k = Math.max(0, state.todayIdx - 14); k <= state.todayIdx; k++) cum15 += w.rain[k];
+    let body = `<h3>${placeLabel(la, lo)}</h3><div class="note" style="margin:0">${la.toFixed(5)}, ${lo.toFixed(5)} · case de ${cellM} m · ${km(B.center[0], B.center[1], la, lo).toFixed(1)} km d'Aix</div>`;
+    if (!(RCH[i] & 128)) { el.innerHTML = body + `<p class="note">Hors de la zone des ${B.radiusKm} km.</p>`; return; }
+    const kv = `<dt>Couvert</dt><dd>${coverLabel(i)}</dd><dt>Altitude</dt><dd>${elevOf(i)} m, ${aspectLabel(i)}</dd><dt>Relief</dt><dd>${TPI_LABEL[tpiOf(i)]}</dd>`;
+    if (!coverOf(i)) { el.innerHTML = body + `<dl class="kv">${kv}</dl><p class="note">Indice nul : ni forêt, ni garrigue, ni prairie cartographiée sur cette case.</p>` + links(la, lo); return; }
+    const f = dayFactors(state.day), m = medOf(i), w = state.med[m], d = state.todayIdx + state.day, z = elevOf(i);
+    const rows = SPECIES.map((sp, k) => ({ sp, s: cellScore(i, k, f) })).sort((x, y) => y.s - x.s);
+    let cum = 0; for (let k = Math.max(0, state.todayIdx - 14); k <= state.todayIdx; k++) cum += w.rain[k];
     let fut = 0; for (let k = state.todayIdx + 1; k < w.rain.length; k++) fut += w.rain[k];
-    body += `<div class="bars">` + rows.map(({ sp, r }) => `<div class="bar"><span>${sp.name}</span><span class="t"><span style="width:${r.total}%;background:${css(r.total)}"></span></span><span class="v">${Math.round(r.total)}</span></div>`).join("") + `</div>`;
+    const wx = Model.weather(SPECIES[0], w, d, dayDate(state.day));
+    body += `<div class="bars">` + rows.map(({ sp, s }) => `<div class="bar"><span>${sp.name}</span><span class="t"><span style="width:${s}%;background:${solid(s)}"></span></span><span class="v">${Math.round(s)}</span></div>`).join("") + `</div>`;
     body += `<h2 style="margin-top:12px">Pluie</h2>` + rainChart(w);
-    body += `<dl class="kv">
-      <dt>Pluie 15 derniers jours</dt><dd>${cum15.toFixed(0)} mm</dd>
+    body += `<dl class="kv">${kv}
+      <dt>Pluie 15 derniers jours</dt><dd>${cum.toFixed(0)} mm</dd>
       <dt>Pluie prévue 6 j</dt><dd>${fut.toFixed(0)} mm</dd>
-      <dt>Humidité du sol</dt><dd>${(top.sm * 100).toFixed(0)} % vol. (${top.sm < 0.13 ? "sec" : top.sm < 0.22 ? "frais" : "humide"})</dd>
-      <dt>Humidité de l'air</dt><dd>${top.rh.toFixed(0)} %</dd>
-      <dt>Temp. moy. 7 j</dt><dd>${top.tm.toFixed(1)} °C (min ${top.tmin.toFixed(1)} °C)</dd>
-      <dt>Altitude</dt><dd>${b.elev} m, ${aspectLabel(b)}</dd>
-      <dt>Couvert</dt><dd>${covertLabel(b)}</dd></dl>`;
-    el.innerHTML = body + links(ll);
+      <dt>Humidité du sol</dt><dd>${(wx.sm * 100).toFixed(0)} % vol. (${wx.sm < 0.13 ? "sec" : wx.sm < 0.22 ? "frais" : "humide"})</dd>
+      <dt>Humidité de l'air</dt><dd>${wx.rh.toFixed(0)} %</dd>
+      <dt>Temp. moy. 7 j</dt><dd>${(interp(f.tm, neighbours(i)) - LAPSE * z).toFixed(1)} °C (min ${(interp(f.tn, neighbours(i)) - LAPSE * z).toFixed(1)} °C)</dd></dl>`;
+    el.innerHTML = body + links(la, lo);
   }
-  function links(ll) {
-    const c = `${ll.lat.toFixed(5)},${ll.lng.toFixed(5)}`;
+  function links(la, lo) {
+    const c = `${la.toFixed(5)},${lo.toFixed(5)}`;
     return `<div class="links"><a href="https://www.google.com/maps/dir/?api=1&destination=${c}" target="_blank" rel="noopener">Itinéraire</a>
-      <a href="https://www.geoportail.gouv.fr/carte?c=${ll.lng.toFixed(5)},${ll.lat.toFixed(5)}&z=15&l0=GEOGRAPHICALGRIDSYSTEMS.MAPS::GEOPORTAIL:OGC:WMTS(1)&permalink=yes" target="_blank" rel="noopener">Carte IGN</a>
+      <a href="https://www.geoportail.gouv.fr/carte?c=${lo.toFixed(5)},${la.toFixed(5)}&z=17&l0=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2::GEOPORTAIL:OGC:WMTS(1)&permalink=yes" target="_blank" rel="noopener">Géoportail</a>
       <button type="button" class="btn" id="copy">Copier les coordonnées</button></div>`;
   }
 
   function cellAt(lat, lon) {
-    const r = Math.floor((B.N - lat) / B.dlat), c = Math.floor((lon - B.W) / B.dlon);
-    if (r < 0 || c < 0 || r >= ROWS || c >= COLS) return -1;
-    return r * COLS + c;
+    const r = Math.floor((B.N - lat) / DLAT), c = Math.floor((lon - B.W) / DLON);
+    return r < 0 || c < 0 || r >= ROWS || c >= COLS ? -1 : r * COLS + c;
   }
 
   function render() {
-    drawOverlay(scoresFor(state.day)[state.sp]);
+    computeScores();
+    overlay.redraw();
     renderSpecies(); renderDays(); renderSpots();
-    if (state.sel != null) showDetail(state.sel, state.marker && state.marker.getLatLng());
+    if (state.sel != null) showDetail(state.sel);
   }
+  const busy = (fn) => { setStatus("Calcul…", "load"); setTimeout(() => { fn(); setStatus(state.statusText); }, 20); };
 
-  $("species").addEventListener("click", (e) => { const b = e.target.closest(".chip"); if (!b) return; state.sp = b.dataset.id; save(); render(); });
-  $("days").addEventListener("click", (e) => { const b = e.target.closest(".day"); if (!b) return; state.day = +b.dataset.o; render(); });
+  $("species").addEventListener("click", (e) => { const b = e.target.closest(".chip"); if (!b) return; state.sp = b.dataset.id; save(); busy(render); });
+  $("days").addEventListener("click", (e) => { const b = e.target.closest(".day"); if (!b) return; state.day = +b.dataset.o; busy(render); });
   function spotGo(e) {
     const li = e.target.closest("li[data-i]"); if (!li) return;
-    const i = +li.dataset.i; map.flyTo([bio[i].lat, bio[i].lon], 13); showDetail(i);
+    const i = +li.dataset.i; map.flyTo([cellLat(Math.floor(i / COLS)), cellLon(i % COLS)], 17); showDetail(i);
     if (window.innerWidth <= 760) $("detail").scrollIntoView({ behavior: "smooth" });
   }
   $("spots").addEventListener("click", spotGo);
   $("spots").addEventListener("keydown", (e) => { if (e.key === "Enter") spotGo(e); });
   $("detail").addEventListener("click", (e) => {
-    if (e.target.id !== "copy" || !state.marker) return;
-    const ll = state.marker.getLatLng(), t = `${ll.lat.toFixed(5)}, ${ll.lng.toFixed(5)}`;
+    if (e.target.id !== "copy" || state.sel == null) return;
+    const t = `${cellLat(Math.floor(state.sel / COLS)).toFixed(5)}, ${cellLon(state.sel % COLS).toFixed(5)}`;
     navigator.clipboard?.writeText(t).then(() => { e.target.textContent = "Copié"; }, () => { e.target.textContent = t; });
   });
-  map.on("click", (e) => { if (!state.cellW) return; const i = cellAt(e.latlng.lat, e.latlng.lng); if (i >= 0) showDetail(i, e.latlng); });
+  $("opacity").addEventListener("input", (e) => overlay.setOpacity(e.target.value / 100));
+  map.on("click", (e) => { if (!state.scores) return; const i = cellAt(e.latlng.lat, e.latlng.lng); if (i >= 0) showDetail(i); });
 
   function save() { try { localStorage.setItem("champiAix.sp", state.sp); } catch (_) { } }
   try { const s = localStorage.getItem("champiAix.sp"); if (s && (s === "all" || SPECIES.some(x => x.id === s))) state.sp = s; } catch (_) { }
 
   function apply(wx) {
     state.weather = wx;
-    state.todayIdx = Math.max(0, wx.points[0].time.indexOf(todayStr()));
-    if (wx.points[0].time.indexOf(todayStr()) < 0) state.todayIdx = PAST;
-    state.cellW = buildCellWeather(wx);
-    dayCache.clear();
+    const t = wx.points[0].time.indexOf(todayStr());
+    state.todayIdx = t >= 0 ? t : PAST;
+    state.med = buildMed(wx);
+    dayCache.clear(); maxCache.clear();
+    const at = new Date(wx.fetchedAt);
+    state.statusText = `Météo du ${at.toLocaleDateString("fr-FR", { day: "numeric", month: "long" })} à ${at.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`;
     render();
-    const t = new Date(wx.fetchedAt);
-    setStatus(`Météo du ${t.toLocaleDateString("fr-FR", { day: "numeric", month: "long" })} à ${t.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`);
+    setStatus(state.statusText);
   }
 
   async function load(force) {
@@ -403,8 +515,9 @@
     }
   }
   $("refresh").addEventListener("click", () => load(true));
-  // la carte se remet à jour seule si la page reste ouverte (changement de jour ou météo > 6 h)
   setInterval(() => load(false), 30 * 60e3);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) load(false); });
-  load(false);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.med) load(false); });
+
+  setStatus("Préparation de la carte…", "load");
+  decodeBiotope().then(() => load(false), (e) => setStatus("Erreur : " + e.message, "err"));
 })();

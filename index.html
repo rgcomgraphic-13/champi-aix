@@ -59,7 +59,9 @@ ol.spots { list-style: none; padding: 0; margin: 0; display: flex; flex-directio
 .spots .where { min-width: 0; } .spots .where b { display: block; font-weight: 600; }
 .spots .where span { font-size: 12.5px; color: var(--muted); }
 .spots .km { font: 12px var(--mono); color: var(--muted); }
-.empty { font-size: 13.5px; color: var(--muted); padding: 8px 0; }
+.spots li.empty { display: block; cursor: default; font-size: 13.5px; color: var(--muted); padding: 8px 0; }
+.opa { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); margin-top: 12px; }
+.opa input { flex: 1; accent-color: var(--accent); }
 #detail[hidden] { display: none; }
 #detail { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: var(--bg); }
 #detail h3 { font: 700 18px var(--display); margin: 0 0 2px; }
@@ -77,8 +79,6 @@ footer { font-size: 12px; color: var(--muted); margin-top: auto; }
 footer a { color: inherit; }
 .warn { font-size: 12.5px; border-left: 3px solid var(--accent); padding: 4px 0 4px 10px; color: var(--muted); }
 .leaflet-container { font: inherit; }
-.leaflet-tile-pane .muted { filter: grayscale(.9) contrast(.9) brightness(1.06); }
-@media (prefers-color-scheme: dark) { .leaflet-tile-pane .muted { filter: grayscale(.9) brightness(.62) contrast(1.1); } }
 .leaflet-control-layers, .leaflet-bar a { background: var(--panel); color: var(--fg); }
 .locate { width: 34px; height: 34px; display: grid; place-items: center; font-size: 18px; }
 
@@ -93,7 +93,7 @@ footer a { color: inherit; }
 <body>
 <aside id="panel">
   <header>
-    <h1>Champi Aix<small>Prévision de pousse · Aix-en-Provence et 50 km autour</small></h1>
+    <h1>Champi Aix<small>Prévision de pousse · Aix-en-Provence et 25 km autour · cases de 25 m</small></h1>
   </header>
   <div class="status"><span id="dot" class="dot load"></span><span id="status">Chargement de la météo…</span>
     <button id="refresh" class="btn" type="button">Actualiser</button></div>
@@ -111,9 +111,11 @@ footer a { color: inherit; }
 
   <section>
     <div class="legend" aria-hidden="true">
-      <span style="background:#f1e28c"></span><span style="background:#ecb234"></span><span style="background:#de6a1e"></span><span style="background:#b42818"></span><span style="background:#64101e"></span>
+      <span style="background:#fabe78"></span><span style="background:#f69646"></span><span style="background:#f06428"></span><span style="background:#e43418"></span><span style="background:#af120c"></span>
     </div>
     <div class="legend-l"><span>Faible</span><span>Moyen</span><span>Bon</span><span>Excellent</span></div>
+    <label class="opa" for="opacity">Opacité du quadrillage <input id="opacity" type="range" min="20" max="100" value="90"></label>
+    <p class="note">Zoomez pour voir chaque case de 25 m. Cliquez sur une case pour son détail.</p>
   </section>
 
   <section id="detail" hidden aria-live="polite"></section>
@@ -125,13 +127,13 @@ footer a { color: inherit; }
 
   <p class="warn">Indice de probabilité, pas une garantie. Ne consommez jamais un champignon sans identification certaine (pharmacien, société mycologique). En été, vérifiez l'ouverture des massifs avant de partir.</p>
 
-  <footer>Météo <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (mise à jour à chaque ouverture) · Forêts © contributeurs <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · Fond <a href="https://opentopomap.org" target="_blank" rel="noopener">OpenTopoMap</a></footer>
+  <footer>Météo <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (mise à jour à chaque ouverture) · Essences forestières BD Forêt © <a href="https://geoservices.ign.fr/bdforet" target="_blank" rel="noopener">IGN</a> · Forêts et fonds de carte © contributeurs <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>, IGN</footer>
 </aside>
 <div id="map"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script src="biotope.js?v=3"></script>
-<script src="model.js?v=3"></script>
-<script src="app.js?v=3"></script>
+<script src="biotope.js?v=10"></script>
+<script src="model.js?v=10"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>
