@@ -1,0 +1,3 @@
+# données brutes OSM / altitude (44 Mo) : régénérables avec les scripts de data/
+data/*.json
+.DS_Store

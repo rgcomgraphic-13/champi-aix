@@ -1,0 +1,10 @@
+[out:json][timeout:300][maxsize:1073741824];
+(
+  way["landuse"="forest"](43.07,4.81,43.99,6.08);
+  relation["landuse"="forest"](43.07,4.81,43.99,6.08);
+  way["natural"="wood"](43.07,4.81,43.99,6.08);
+  relation["natural"="wood"](43.07,4.81,43.99,6.08);
+  way["landuse"~"^(meadow|grass)$"](43.07,4.81,43.99,6.08);
+  way["natural"="grassland"](43.07,4.81,43.99,6.08);
+);
+out tags geom qt;

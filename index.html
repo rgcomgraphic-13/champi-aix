@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Champi Aix</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+/* Layout : carte plein écran, panneau latéral (bas de l'écran sur téléphone) */
+:root {
+  --bg: #eef0ea; --panel: #fbfcf8; --fg: #1d2620; --muted: #5d6a60; --line: #d5dbd0;
+  --accent: #a3461f; --accent-soft: #f3dfd2; --moss: #4f6b3a;
+  --display: "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121813; --panel: #1a211b; --fg: #e3e9df; --muted: #9aa797; --line: #2e3a30;
+    --accent: #e3804d; --accent-soft: #3a2519; --moss: #9cbc80; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--fg); font: 15px/1.45 var(--body); display: grid; grid-template-columns: 380px 1fr; }
+#map { height: 100%; background: var(--bg); }
+aside { height: 100%; overflow-y: auto; background: var(--panel); border-right: 1px solid var(--line);
+  padding: 18px 18px 28px; display: flex; flex-direction: column; gap: 18px; }
+h1 { font: 700 26px/1 var(--display); margin: 0; letter-spacing: -0.01em; }
+h1 small { display: block; font: 400 13px/1.3 var(--body); color: var(--muted); margin-top: 6px; letter-spacing: 0; }
+h2 { font: 700 13px/1 var(--body); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 8px; }
+.status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--moss); flex: none; }
+.dot.load { background: #d9a03a; animation: pulse 1s infinite; } .dot.err { background: #c0392b; }
+@keyframes pulse { 50% { opacity: .3 } }
+@media (prefers-reduced-motion: reduce) { .dot.load { animation: none; } }
+button, select { font: inherit; color: inherit; }
+.btn { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 13px; }
+.btn:hover { border-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.species { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--line); background: transparent; border-radius: 999px; padding: 4px 11px; cursor: pointer; font-size: 13.5px; }
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.chip .n { font: 600 11px var(--mono); opacity: .75; margin-left: 4px; }
+.days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.day { border: 1px solid var(--line); background: transparent; border-radius: 6px; padding: 5px 0 4px; cursor: pointer; text-align: center; font-size: 12px; line-height: 1.15; }
+.day b { display: block; font: 600 13px var(--mono); }
+.day i { display: block; height: 4px; margin: 4px 6px 0; border-radius: 2px; background: var(--line); font-style: normal; }
+.day[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.note { font-size: 13.5px; color: var(--muted); margin: 8px 0 0; }
+.legend { display: flex; height: 10px; border-radius: 3px; overflow: hidden; }
+.legend span { flex: 1; }
+.legend-l { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 4px; }
+ol.spots { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; }
+.spots li { display: grid; grid-template-columns: 44px 1fr auto; gap: 10px; align-items: center; padding: 8px 4px; border-top: 1px solid var(--line); cursor: pointer; }
+.spots li:hover { background: var(--bg); }
+.score { font: 600 15px var(--mono); text-align: center; border-radius: 5px; padding: 3px 0; color: #fff; }
+.spots .where { min-width: 0; } .spots .where b { display: block; font-weight: 600; }
+.spots .where span { font-size: 12.5px; color: var(--muted); }
+.spots .km { font: 12px var(--mono); color: var(--muted); }
+.empty { font-size: 13.5px; color: var(--muted); padding: 8px 0; }
+#detail[hidden] { display: none; }
+#detail { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: var(--bg); }
+#detail h3 { font: 700 18px var(--display); margin: 0 0 2px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13.5px; margin: 10px 0; }
+.kv dt { color: var(--muted); } .kv dd { margin: 0; font-variant-numeric: tabular-nums; }
+.bars { display: flex; flex-direction: column; gap: 4px; margin: 10px 0; }
+.bar { display: grid; grid-template-columns: 128px 1fr 30px; gap: 8px; align-items: center; font-size: 13px; }
+.bar .t { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
+.bar .t span { display: block; height: 100%; }
+.bar .v { font: 12px var(--mono); text-align: right; }
+.rain { width: 100%; height: 76px; display: block; }
+.links { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.links a { color: var(--accent); font-weight: 600; font-size: 13.5px; }
+footer { font-size: 12px; color: var(--muted); margin-top: auto; }
+footer a { color: inherit; }
+.warn { font-size: 12.5px; border-left: 3px solid var(--accent); padding: 4px 0 4px 10px; color: var(--muted); }
+.leaflet-container { font: inherit; }
+.leaflet-tile-pane .muted { filter: grayscale(.9) contrast(.9) brightness(1.06); }
+@media (prefers-color-scheme: dark) { .leaflet-tile-pane .muted { filter: grayscale(.9) brightness(.62) contrast(1.1); } }
+.leaflet-control-layers, .leaflet-bar a { background: var(--panel); color: var(--fg); }
+.locate { width: 34px; height: 34px; display: grid; place-items: center; font-size: 18px; }
+
+@media (max-width: 760px) {
+  body { grid-template-columns: 1fr; grid-template-rows: 52% 48%; }
+  aside { order: 2; border-right: 0; border-top: 1px solid var(--line); padding: 14px 16px 24px; gap: 14px; }
+  #map { order: 1; }
+  .bar { grid-template-columns: 110px 1fr 28px; }
+}
+</style>
+</head>
+<body>
+<aside id="panel">
+  <header>
+    <h1>Champi Aix<small>Prévision de pousse · Aix-en-Provence et 50 km autour</small></h1>
+  </header>
+  <div class="status"><span id="dot" class="dot load"></span><span id="status">Chargement de la météo…</span>
+    <button id="refresh" class="btn" type="button">Actualiser</button></div>
+
+  <section>
+    <h2>Espèce</h2>
+    <div id="species" class="species" role="group" aria-label="Espèce"></div>
+    <p id="spnote" class="note"></p>
+  </section>
+
+  <section>
+    <h2>Jour</h2>
+    <div id="days" class="days" role="group" aria-label="Jour"></div>
+  </section>
+
+  <section>
+    <div class="legend" aria-hidden="true">
+      <span style="background:#f1e28c"></span><span style="background:#ecb234"></span><span style="background:#de6a1e"></span><span style="background:#b42818"></span><span style="background:#64101e"></span>
+    </div>
+    <div class="legend-l"><span>Faible</span><span>Moyen</span><span>Bon</span><span>Excellent</span></div>
+  </section>
+
+  <section id="detail" hidden aria-live="polite"></section>
+
+  <section>
+    <h2>Meilleurs coins du jour</h2>
+    <ol id="spots" class="spots"></ol>
+  </section>
+
+  <p class="warn">Indice de probabilité, pas une garantie. Ne consommez jamais un champignon sans identification certaine (pharmacien, société mycologique). En été, vérifiez l'ouverture des massifs avant de partir.</p>
+
+  <footer>Météo <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> (mise à jour à chaque ouverture) · Forêts © contributeurs <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · Fond <a href="https://opentopomap.org" target="_blank" rel="noopener">OpenTopoMap</a></footer>
+</aside>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="biotope.js?v=3"></script>
+<script src="model.js?v=3"></script>
+<script src="app.js?v=3"></script>
+</body>
+</html>
