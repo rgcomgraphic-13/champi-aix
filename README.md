@@ -4,7 +4,9 @@ Carte de prévision de pousse des champignons sur Aix-en-Provence et 50 km autou
 
 ## Utilisation
 
-Ouvrez `index.html` dans votre navigateur (double-clic). Une connexion internet est nécessaire.
+En ligne : https://rgcomgraphic-13.github.io/champi-aix/ (sur téléphone : « Ajouter à l'écran d'accueil »).
+
+En local : ouvrez `index.html` dans votre navigateur (double-clic). Une connexion internet est nécessaire.
 
 - La météo est téléchargée depuis Open-Meteo à chaque ouverture : la carte est donc à jour tous les jours, sans rien faire. Si la page reste ouverte, elle se met à jour toute seule toutes les 6 heures et au changement de jour.
 - Choisissez une espèce et un jour (aujourd'hui + 6 jours de prévision).
